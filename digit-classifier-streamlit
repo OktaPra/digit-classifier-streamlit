@@ -1,0 +1,231 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+import cv2
+import os
+from PIL import Image
+
+# Optional: Canvas
+try:
+    from streamlit_drawable_canvas import st_canvas
+    HAS_CANVAS = True
+except:
+    HAS_CANVAS = False
+
+# TensorFlow
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential, load_model
+    from tensorflow.keras.layers import Dense, Conv2D, Flatten, MaxPooling2D
+    from tensorflow.keras.datasets import mnist
+except:
+    tf = None
+
+# ============================
+# Config & Constants
+# ============================
+st.set_page_config(page_title="Digit Classifier (CNN)", layout="wide")
+st.title("🖼️ → 🔢 Digit Classifier (CNN)")
+
+MODEL_FILE = "cnn_mnist.h5"
+CANVAS_SIZE = 280
+
+# Session state
+if "model" not in st.session_state:
+    st.session_state.model = None
+
+# ============================
+# Utils: Preprocessing
+# ============================
+def preprocess_from_array(img_array):
+    if img_array.ndim == 3:
+        if img_array.shape[2] == 4:
+            img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB)
+        img = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    else:
+        img = img_array.copy()
+
+    img = cv2.GaussianBlur(img, (5, 5), 0)
+    _, thresh = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    if np.mean(thresh) > 127:
+        thresh = 255 - thresh
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.zeros((1,28,28,1), dtype="float32"), np.zeros((28,28), dtype="uint8")
+
+    c = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(c)
+    roi = thresh[y:y+h, x:x+w]
+
+    if w > 0 and h > 0:
+        scale = 20.0 / max(w, h)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        resized = cv2.resize(roi, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    else:
+        resized = cv2.resize(roi, (20,20), interpolation=cv2.INTER_AREA)
+
+    padded = np.zeros((28, 28), dtype=np.uint8)
+    x_offset = (28 - resized.shape[1]) // 2
+    y_offset = (28 - resized.shape[0]) // 2
+    padded[y_offset:y_offset+resized.shape[0], x_offset:x_offset+resized.shape[1]] = resized
+
+    M = cv2.moments(padded)
+    if M["m00"] != 0:
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        shiftx = int(np.round(14 - cx))
+        shifty = int(np.round(14 - cy))
+        T = np.float32([[1, 0, shiftx], [0, 1, shifty]])
+        padded = cv2.warpAffine(padded, T, (28, 28), borderValue=0)
+
+    arr = padded.astype("float32") / 255.0
+    arr = arr.reshape(1, 28, 28, 1)
+    return arr, padded
+
+def preprocess_from_filelike(filelike):
+    image = Image.open(filelike).convert("RGB")
+    arr = np.array(image)
+    return preprocess_from_array(arr)
+
+# ============================
+# Model builder
+# ============================
+def build_model():
+    model = Sequential([
+        Conv2D(32, (3, 3), activation='relu', input_shape=(28, 28, 1)),
+        MaxPooling2D((2, 2)),
+        Flatten(),
+        Dense(128, activation='relu'),
+        Dense(10, activation='softmax')
+    ])
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+# ============================
+# Sidebar: Train / Load
+# ============================
+st.sidebar.header("Model Options")
+
+# Parameter training
+use_subset = st.sidebar.checkbox("Gunakan subset kecil (lebih cepat)", value=True)
+epochs = st.sidebar.number_input("Epochs", min_value=1, max_value=20, value=3)
+batch_size = st.sidebar.number_input("Batch Size", min_value=32, max_value=512, value=128, step=32)
+
+def train_model(use_subset=True, epochs=3, batch_size=128):
+    if tf is None:
+        st.sidebar.error("Install TensorFlow: `pip install tensorflow`")
+        return None
+
+    (x_train, y_train), (x_test, y_test) = mnist.load_data()
+    x_train = x_train.astype("float32") / 255.0
+    x_test = x_test.astype("float32") / 255.0
+    x_train = x_train.reshape(-1, 28, 28, 1)
+    x_test = x_test.reshape(-1, 28, 28, 1)
+
+    if use_subset:
+        x_train, y_train = x_train[:10000], y_train[:10000]
+        x_test, y_test = x_test[:2000], y_test[:2000]
+
+    model = build_model()
+    progress = st.sidebar.progress(0)
+    status = st.sidebar.empty()
+
+    class CB(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            progress.progress((epoch+1)/epochs)
+            logs = logs or {}
+            status.text(f"Epoch {epoch+1}/{epochs} - loss: {logs.get('loss',0):.4f}, acc: {logs.get('accuracy',0):.4f}")
+
+    with st.spinner("Training..."):
+        model.fit(x_train, y_train, epochs=epochs, batch_size=batch_size,
+                  validation_data=(x_test, y_test), callbacks=[CB()], verbose=0)
+
+    model.save(MODEL_FILE)
+    st.sidebar.success("Training selesai, model disimpan.")
+    return model
+
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    if st.button("Train Model"):
+        model = train_model(use_subset, epochs, batch_size)
+        if model:
+            st.session_state.model = model
+with col2:
+    if st.button("Load Saved Model"):
+        if os.path.exists(MODEL_FILE):
+            try:
+                model = load_model(MODEL_FILE)
+                st.session_state.model = model
+                st.sidebar.success(f"Model {MODEL_FILE} dimuat.")
+            except Exception as e:
+                st.sidebar.error(f"Gagal load model: {e}")
+        else:
+            st.sidebar.warning("Model belum ada. Latih dulu.")
+
+# ============================
+# Main UI
+# ============================
+st.markdown("## Input")
+input_col, output_col = st.columns([1,1])
+
+with input_col:
+    mode = st.radio("Mode input", ("Canvas (draw)", "Upload image"), index=0 if HAS_CANVAS else 1)
+    canvas_result = None
+    uploaded_file = None
+
+    if mode == "Canvas (draw)" and HAS_CANVAS:
+        st.markdown("Gambar digit (warna putih di background hitam)")
+        canvas_result = st_canvas(
+            fill_color="#FFFFFF", stroke_width=18, stroke_color="#FFFFFF",
+            background_color="#000000", height=CANVAS_SIZE, width=CANVAS_SIZE, key="canvas"
+        )
+    if mode == "Upload image":
+        uploaded_file = st.file_uploader("Upload gambar digit", type=["png","jpg","jpeg"])
+
+    if st.button("Predict"):
+        if tf is None:
+            st.error("Install TensorFlow dulu: `pip install tensorflow`")
+        elif st.session_state.model is None:
+            st.warning("Model belum dilatih / dimuat.")
+        else:
+            model = st.session_state.model
+            try:
+                if uploaded_file is not None:
+                    inp, disp = preprocess_from_filelike(uploaded_file)
+                elif canvas_result is not None and canvas_result.image_data is not None:
+                    rgba = canvas_result.image_data.astype(np.uint8)
+                    inp, disp = preprocess_from_array(rgba[..., :3])
+                else:
+                    st.warning("Tidak ada input.")
+                    inp, disp = None, None
+
+                if inp is not None:
+                    preds = model.predict(inp)
+                    probs = preds.flatten()
+                    pred_class = int(np.argmax(probs))
+
+                    with output_col:
+                        st.markdown("### Processed (28×28)")
+                        st.image(disp, width=200, caption="Processed (28×28)")
+                        st.markdown(f"### 🔍 Prediction: **{pred_class}**")
+                        df_probs = pd.DataFrame(probs, index=[str(i) for i in range(10)], columns=["Probability"])
+                        st.bar_chart(df_probs)
+                        st.write("Top 3:")
+                        top3 = probs.argsort()[-3:][::-1]
+                        for i in top3:
+                            st.write(f"{i}: {probs[i]:.4f}")
+            except Exception as ex:
+                st.error(f"Error: {ex}")
+
+with output_col:
+    st.markdown("## Info")
+    st.write("- Klik **Train Model** atau **Load Saved Model** dulu.")
+    st.write("- Canvas: warna putih di background hitam.")
+    st.write("- Bisa upload gambar atau menggambar langsung.")
+    if not HAS_CANVAS:
+        st.info("Install `streamlit-drawable-canvas` untuk fitur canvas.")
+    if tf is None:
+        st.error("Install TensorFlow: `pip install tensorflow`")
